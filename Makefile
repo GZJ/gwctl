@@ -1,12 +1,13 @@
 GOCMD=go
-GOSRCS=$(wildcard *.go)
+BINDIR=bin
 
-BINS=$(patsubst %.go,%.exe,$(GOSRCS))
+COMMANDS := gwc-exist gwc-focuse gwc-hide-altab gwc-hide-vis gwc-max gwc-min gwc-move gwc-move-resize gwc-resize gwc-restore gwc-show-altab gwc-show-vis gwc-tray
 
-all: $(BINS)
+all: $(COMMANDS)
 
-%.exe: %.go
-	$(GOCMD) build -o $@ $<
+$(COMMANDS):
+	mkdir -p $(BINDIR)
+	$(GOCMD) build -o $(BINDIR)/$@ ./cmd/$@
 
 clean:
-	rm -f $(BINS)
+	rm -rf $(BINDIR)
