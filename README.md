@@ -1,3 +1,3 @@
 # gwctl
 
-Suite of Window Management Tools for Windows
+Suite of Window Management Tools

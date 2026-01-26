@@ -37,6 +37,12 @@ type AppState struct {
 
 var state AppState
 
+var ignoredModifierMasks = []uint16{
+	xproto.ModMaskLock,
+	xproto.ModMask2,
+	xproto.ModMask3,
+}
+
 func initAppState() {
 	state = AppState{
 		exitSignal: make(chan struct{}),
@@ -319,17 +325,7 @@ func setupKeyboardShortcut() error {
 		return err
 	}
 
-	err = xproto.GrabKeyChecked(
-		state.conn,
-		true,
-		state.root,
-		state.keyMods,
-		state.keyCode,
-		xproto.GrabModeAsync,
-		xproto.GrabModeAsync,
-	).Check()
-
-	return err
+	return grabKeyWithModifierVariants()
 }
 
 func listenForKeyEvents() {
@@ -348,13 +344,64 @@ func listenForKeyEvents() {
 
 			switch e := ev.(type) {
 			case xproto.KeyPressEvent:
-				if e.Detail == state.keyCode && e.State == state.keyMods {
+				if e.Detail == state.keyCode && normalizeEventModifiers(e.State) == state.keyMods {
 					log.Println("Shortcut detected, toggling window visibility")
 					toggleWindowVisibility()
 				}
 			}
 		}
 	}
+}
+
+func grabKeyWithModifierVariants() error {
+	variants := expandedModifierVariants(state.keyMods)
+	for _, mods := range variants {
+		err := xproto.GrabKeyChecked(
+			state.conn,
+			true,
+			state.root,
+			mods,
+			state.keyCode,
+			xproto.GrabModeAsync,
+			xproto.GrabModeAsync,
+		).Check()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func expandedModifierVariants(base uint16) []uint16 {
+	variants := []uint16{base}
+	for _, optional := range ignoredModifierMasks {
+		currentLen := len(variants)
+		for i := 0; i < currentLen; i++ {
+			variant := variants[i] | optional
+			variants = append(variants, variant)
+		}
+	}
+	return dedupeVariants(variants)
+}
+
+func dedupeVariants(variants []uint16) []uint16 {
+	seen := make(map[uint16]struct{}, len(variants))
+	unique := make([]uint16, 0, len(variants))
+	for _, v := range variants {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		unique = append(unique, v)
+	}
+	return unique
+}
+
+func normalizeEventModifiers(mods uint16) uint16 {
+	for _, mask := range ignoredModifierMasks {
+		mods &^= mask
+	}
+	return mods
 }
 
 // --------------------------------- main ---------------------------------
