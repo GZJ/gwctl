@@ -1,4 +1,4 @@
-module gwctl
+module github.com/GZJ/gwctl
 
 go 1.21.0
 
