@@ -21,18 +21,20 @@ import (
 )
 
 type AppState struct {
-	conn       *xgb.Conn
-	winTitle   string
-	winID      string
-	targetWin  xproto.Window
-	isVisible  bool
-	keyCombo   string
-	keyMods    uint16
-	keyCode    xproto.Keycode
-	root       xproto.Window
-	exitSignal chan struct{}
-	mutex      sync.Mutex
-	wg         sync.WaitGroup
+	conn         *xgb.Conn
+	winTitle     string
+	winID        string
+	targetWin    xproto.Window
+	isVisible    bool
+	hiddenByTray bool
+	keyCombo     string
+	keyMods      uint16
+	keyCode      xproto.Keycode
+	root         xproto.Window
+	exitSignal   chan struct{}
+	mutex        sync.Mutex
+	wg           sync.WaitGroup
+	exitOnce     sync.Once
 }
 
 var state AppState
@@ -137,10 +139,12 @@ func setWindowVisibility(conn *xgb.Conn, window xproto.Window, visible bool) {
 		xproto.MapWindow(conn, window)
 		log.Println("Window mapped (shown)")
 		state.isVisible = true
+		state.hiddenByTray = false
 	} else {
 		xproto.UnmapWindow(conn, window)
 		log.Println("Window unmapped (hidden)")
 		state.isVisible = false
+		state.hiddenByTray = true
 	}
 }
 
@@ -247,13 +251,113 @@ func onSystrayExit() {
 	log.Println("Exiting...")
 }
 
-func cleanupAndExit() {
-	close(state.exitSignal)
-	systray.Quit()
-	state.wg.Wait()
-	if state.conn != nil {
-		state.conn.Close()
+func internAtom(name string) (xproto.Atom, error) {
+	reply, err := xproto.InternAtom(state.conn, false, uint16(len(name)), name).Reply()
+	if err != nil {
+		return 0, err
 	}
+	return reply.Atom, nil
+}
+
+func targetSupportsProtocol(protocolsAtom, protocolAtom xproto.Atom) (bool, error) {
+	reply, err := xproto.GetProperty(
+		state.conn,
+		false,
+		state.targetWin,
+		protocolsAtom,
+		xproto.AtomAtom,
+		0,
+		32,
+	).Reply()
+	if err != nil {
+		return false, err
+	}
+
+	for offset := 0; offset+4 <= len(reply.Value); offset += 4 {
+		if xproto.Atom(xgb.Get32(reply.Value[offset:])) == protocolAtom {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func closeTargetWindow() {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	if state.conn == nil || state.targetWin == 0 {
+		return
+	}
+
+	_, err := xproto.GetWindowAttributes(state.conn, state.targetWin).Reply()
+	if err != nil {
+		log.Printf("Skipping close request for target window: %v\n", err)
+		return
+	}
+
+	wmProtocolsAtom, err := internAtom("WM_PROTOCOLS")
+	if err != nil {
+		log.Printf("Failed to resolve WM_PROTOCOLS atom: %v\n", err)
+		return
+	}
+
+	wmDeleteWindowAtom, err := internAtom("WM_DELETE_WINDOW")
+	if err != nil {
+		log.Printf("Failed to resolve WM_DELETE_WINDOW atom: %v\n", err)
+		return
+	}
+
+	supported, err := targetSupportsProtocol(wmProtocolsAtom, wmDeleteWindowAtom)
+	if err != nil {
+		log.Printf("Failed to read WM_PROTOCOLS from target window: %v\n", err)
+		return
+	}
+
+	if supported {
+		event := xproto.ClientMessageEvent{
+			Format: 32,
+			Window: state.targetWin,
+			Type:   wmProtocolsAtom,
+			Data: xproto.ClientMessageDataUnionData32New([]uint32{
+				uint32(wmDeleteWindowAtom),
+				0,
+				0,
+				0,
+				0,
+			}),
+		}
+
+		err = xproto.SendEventChecked(state.conn, false, state.targetWin, 0, string(event.Bytes())).Check()
+		if err != nil {
+			log.Printf("Failed to send WM_DELETE_WINDOW to target window: %v\n", err)
+			return
+		}
+
+		log.Println("Requested graceful shutdown of target window")
+		return
+	}
+
+	err = xproto.DestroyWindowChecked(state.conn, state.targetWin).Check()
+	if err != nil {
+		log.Printf("Failed to destroy target window without WM_DELETE_WINDOW support: %v\n", err)
+		return
+	}
+
+	log.Println("Destroyed target window without WM_DELETE_WINDOW support")
+}
+
+func cleanupAndExit() {
+	state.exitOnce.Do(func() {
+		closeTargetWindow()
+		close(state.exitSignal)
+		systray.Quit()
+		if state.conn != nil {
+			state.conn.Close()
+			state.conn = nil
+		}
+		state.wg.Wait()
+	})
 }
 
 // --------------------------------- hotkey ---------------------------------
@@ -328,7 +432,17 @@ func setupKeyboardShortcut() error {
 	return grabKeyWithModifierVariants()
 }
 
-func listenForKeyEvents() {
+func subscribeTargetWindowLifecycleEvents() error {
+	values := []uint32{uint32(xproto.EventMaskStructureNotify)}
+	return xproto.ChangeWindowAttributesChecked(
+		state.conn,
+		state.targetWin,
+		xproto.CwEventMask,
+		values,
+	).Check()
+}
+
+func listenForXEvents() {
 	state.wg.Add(1)
 	defer state.wg.Done()
 	for {
@@ -338,15 +452,26 @@ func listenForKeyEvents() {
 		default:
 			ev, err := state.conn.WaitForEvent()
 			if err != nil {
+				select {
+				case <-state.exitSignal:
+					return
+				default:
+				}
 				log.Printf("Error waiting for X event: %v\n", err)
 				continue
 			}
 
 			switch e := ev.(type) {
 			case xproto.KeyPressEvent:
-				if e.Detail == state.keyCode && normalizeEventModifiers(e.State) == state.keyMods {
+				if state.keyCombo != "" && e.Detail == state.keyCode && normalizeEventModifiers(e.State) == state.keyMods {
 					log.Println("Shortcut detected, toggling window visibility")
 					toggleWindowVisibility()
+				}
+			case xproto.DestroyNotifyEvent:
+				if e.Window == state.targetWin {
+					log.Println("Target window closed, exiting tray")
+					cleanupAndExit()
+					return
 				}
 			}
 		}
@@ -430,7 +555,7 @@ func main() {
 		log.Fatalf("Cannot open display: %v\n", err)
 		return
 	}
-	defer state.conn.Close()
+	state.root = xproto.Setup(state.conn).DefaultScreen(state.conn).Root
 
 	if state.winTitle != "" {
 		state.targetWin, err = findWindowByTitle(state.conn, state.winTitle)
@@ -445,6 +570,7 @@ func main() {
 		fmt.Println("2. Using a different title than expected")
 		fmt.Println("3. Not accessible to this program")
 		listWindows(state.conn)
+		state.conn.Close()
 		return
 	}
 
@@ -453,15 +579,21 @@ func main() {
 		state.isVisible = attrs.MapState != 0
 	}
 
+	err = subscribeTargetWindowLifecycleEvents()
+	if err != nil {
+		log.Printf("Warning: Failed to subscribe to target window lifecycle events: %v\n", err)
+	}
+
 	if state.keyCombo != "" {
 		err = setupKeyboardShortcut()
 		if err != nil {
 			log.Printf("Warning: Failed to set up keyboard shortcut: %v\n", err)
 		} else {
 			log.Printf("Keyboard shortcut '%s' registered\n", state.keyCombo)
-			go listenForKeyEvents()
 		}
 	}
+
+	go listenForXEvents()
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
