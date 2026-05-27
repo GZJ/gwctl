@@ -56,7 +56,7 @@ func findWindowRecursive(conn *xgb.Conn, parent xproto.Window, title string) (xp
 
 	if err == nil && nameReply != nil && nameReply.ValueLen > 0 {
 		windowName := string(nameReply.Value)
-		if strings.Contains(strings.ToLower(windowName), strings.ToLower(title)) {
+		if strings.EqualFold(windowName, title) {
 			log.Printf("Window title match: %s\n", windowName)
 			return parent, nil
 		}
@@ -85,11 +85,11 @@ func findWindowByTitle(conn *xgb.Conn, title string) (xproto.Window, error) {
 	}
 
 	if target == 0 {
-		log.Printf("No window found with title containing '%s'\n", title)
+		log.Printf("No window found with title exactly matching '%s'\n", title)
 		return 0, fmt.Errorf("window not found")
 	}
 
-	log.Printf("Found window with title containing '%s'\n", title)
+	log.Printf("Found window with title exactly matching '%s'\n", title)
 	return target, nil
 }
 
