@@ -11,3 +11,6 @@ $(COMMANDS):
 
 clean:
 	rm -rf $(BINDIR)
+
+test:
+	$(GOCMD) test ./...
